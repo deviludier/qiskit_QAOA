@@ -1,0 +1,442 @@
+%matplotlib inline
+
+#import math tools
+import numpy as np
+import itertools # 生成全0-全1的所有字符串，用于暴力求解
+
+#import the tools to handle general Graph
+import networkx as nx
+
+#import plotting tools
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from matplotlib.ticker import LinearLocator, FormatStrFormatter
+%config InlineBackend.figure_format = 'svg' #Makes the image look nice
+
+#importing Qiskit
+from qiskit import Aer, IBMQ
+from qiskit import QuantumRegister, ClassicalRegister, QuantumCircuit, execute
+
+from qiskit.providers.ibmq  import least_busy
+from qiskit.tools.monitor import job_monitor
+from qiskit.visualization import plot_histogram
+
+from scipy.optimize import minimize
+
+shots = 1000
+step = 0.01
+lr = 0.01
+
+def random_graph(n,p):
+    '''
+    param n: the numbers of nodes
+    param p: the probability of each edges
+    return : the node set V and edge set E
+    '''
+    V = np.arange(0,n,1)
+    E = []
+    for i in range(n):
+        for j in range(i+1,n):
+            prob = np.random.rand()
+            if(prob < p):
+                w = np.random.rand()
+                tmp = (i,j,w)
+            else:
+                continue
+            E.append(tmp)
+    return V,E
+
+#Generating the butterfly graph with 5 nodes
+n = 15
+p = 0.3
+V,E = random_graph(n,p)
+G = nx.Graph()
+G.add_nodes_from(V)
+G.add_weighted_edges_from(E)
+
+#Generating plot of the Graph
+colors = ['r' for node in G.nodes()]
+default_axes = plt.axes(frameon=True)
+pos = nx.spring_layout(G)
+
+nx.draw_networkx(G, node_color=colors, node_size=600, alpha=1, ax=default_axes, pos=pos)
+
+def circuit(gamma,beta,p):
+    '''
+    param gamma:
+    param beta :
+    param p    :
+    return : QAOA quantum circuit qaoa
+    '''
+    qaoa = QuantumCircuit(n,n)
+    for i in range(n):
+        qaoa.h(i)
+    for t in range(p):
+        for edge in E:
+            k = edge[0]
+            l = edge[1]
+            qaoa.cx(k,l)
+            qaoa.rz(-gamma[t],l)
+            qaoa.cx(k,l)
+        qaoa.barrier()
+        qaoa.rx(2*beta[t], range(len(V)))
+    
+    qaoa.barrier()
+    qaoa.measure(range(len(V)),range(len(V)))
+    return qaoa
+
+def get_counts(gamma, beta, p):
+    '''
+    param gamma:
+    param beta :
+    param p    :
+    return     : the counts results (the tuple(bitstring, times))
+    '''
+    qc = circuit(gamma, beta, p)
+    backend = Aer.get_backend('qasm_simulator')
+    result = execute(qc, backend, shots = shots).result()
+    counts = result.get_counts()
+    return counts
+
+def cost_function_C(x,G):
+    '''
+    param x: a n*1 matrix 
+    param G: input graph G
+    return : the cost_function_C value of bitsting x
+    '''
+    E = G.edges()
+    if(len(x) != len(G.nodes())):
+        return np.nan
+    
+    C = 0;
+    for index in E:
+        e1 = index[0]
+        e2 = index[1]
+        
+        w = G[e1][e2]['weight']
+        tmp = w*x[e1]*(1-x[e2]) + w*x[e2]*(1-x[e1])
+        C = C + tmp
+        
+    return C
+
+def evaluate(gamma, beta, p):
+    '''
+    param gamma:
+    param beta :
+    param p    :
+    return     : the counts results (the tuple(bitstring, times))
+    '''
+    counts = get_counts(gamma, beta, p)
+    avr_C  = 0
+    max_C  = [0,0,0]
+    hist   = {}
+    
+    for k in range(len(G.edges())+1):
+        hist[str(k)] = hist.get(str(k), 0)
+        
+    for sample in list(counts.keys()):
+        #use sampled bit string x to compute C(x)
+        x  = [int(num) for num in list(sample)]
+        tmp_eng = cost_function_C(x,G)
+        
+        #compute the expection value and energy distribution
+        avr_C  = avr_C + counts[sample]*tmp_eng
+        #hist[str(round(tmp_eng))] = hist.get(str(round(tmp_eng)),0) +counts[sample]
+        
+        #saving best bit string
+        if(max_C[1] < tmp_eng):
+            max_C[0] = sample
+            max_C[1] = tmp_eng
+            max_C[2] = counts[sample]/shots
+        
+    M1_sampled = avr_C/shots
+    return M1_sampled,max_C
+
+def brute_force(n):
+    '''
+    使用暴力搜索的方法求解，最终返回问题的最优解z以及最优解z对应的C(z)的值
+    '''
+    scores = []
+    max_strings = []
+    perms= ["".join(seq) for seq in itertools.product("01", repeat=n)]
+    for xk in perms:
+        tmp = list(map(int,str(xk)))
+        Ek = cost_function_C(tmp,G)
+        scores.append(Ek)
+    max_C = max(scores)
+    
+    for k in range(len(scores)):
+        score_k = scores[k]
+        xk = perms[k]
+        if(score_k == max_C):
+            max_strings.append(xk)
+    return max_C,max_strings
+
+def deliver(A,p):
+    B = np.zeros(p)
+    for t in range(p):
+        B[t] = A[t]
+    return B
+
+def gradient(z):
+    '''
+    CENTRAL FINITE DIFFERENCE CALCULATION
+    param z:the parameters of objective function
+    return :the gradient of objective function at point(z)
+    '''
+    h = np.cbrt(np.finfo(float).eps)
+    d = len(x)
+    nabla = np.zeros(d)
+    for i in range(d): 
+        x_for = np.copy(x) 
+        x_back = np.copy(x)
+        x_for[i] += h 
+        x_back[i] -= h 
+        nabla[i] = (f(x_for) - f(x_back))/(2*h) 
+    return nabla 
+
+def gradient_g(gamma, beta, p):
+    '''
+    param gamma:
+    param beta :
+    param p    :
+    return     : the gamma-partial gradient list of cost function 
+    '''
+    grad = []
+    for t in range(p):
+        gamma1 = deliver(gamma, p)
+        gamma2 = deliver(gamma, p)
+        gamma1[t] = gamma1[t] + step
+        gamma2[t] = gamma2[t] - step
+        mean1,max1 = evaluate(gamma1,beta,p)
+        mean2,max2 = evaluate(gamma2,beta,p)
+        tmp = mean1-mean2
+        grad.append(tmp)
+    return grad
+
+def gradient_b(gamma, beta, p):
+    '''
+    param gamma:
+    param beta :
+    param p    :
+    return     : the beta-partial gradient list of cost function
+    '''
+    grad = []
+    for t in range(p):
+        beta1 = deliver(beta, p)
+        beta2 = deliver(beta, p)
+        beta1[t] = beta1[t] + step
+        beta2[t] = beta2[t] - step
+        mean1,max1 = evaluate(gamma,beta1,p)
+        mean2,max2 = evaluate(gamma,beta2,p)
+        tmp = mean1-mean2
+        grad.append(tmp)
+    return grad
+
+p = 2
+# beta = np.random.random(p)*np.pi*2
+# gamma = np.random.random(p)*np.pi
+beta  = np.zeros(p)
+gamma = np.zeros(p)
+loss_list = []
+max_list  = []
+for epoch in range(50):
+    print('epoch = ',epoch, evaluate(gamma,beta,p))
+    mean,max_C = evaluate(gamma,beta,p)
+    loss_list.append(mean)
+    max_list.append(max_C)
+    grad_g = gradient_g(gamma,beta,p)
+    grad_b = gradient_b(gamma,beta,p)
+    for t in range(p):
+        gamma[t] = gamma[t] + lr*grad_g[t]
+        beta[t]  = beta[t]  + lr*grad_b[t]
+
+plt.plot(loss_list)
+
+m = np.zeros(50)
+for t in range(50):
+    m[t] = max_list[t][1]
+plt.plot(m)
+
+p = 2
+g = 0.3
+b = 0.3
+# beta = np.random.random(p)*np.pi*2
+# gamma = np.random.random(p)*np.pi
+beta  = np.zeros(p)
+gamma = np.zeros(p)
+loss_list = []
+max_list  = []
+max_C     = np.zeros(3)
+max_gamma = np.zeros(p)
+max_beta  = np.zeros(p)
+for epoch in range(50):
+    print('epoch = ',epoch, evaluate(gamma,beta,p))
+    loss_list.append(get_mean(gamma, beta,p))
+    max_list.append(get_max(gamma, beta,p))
+    grad_g = gradient_g(gamma,beta,p)
+    grad_b = gradient_b(gamma,beta,p)
+    tmp = max_list[epoch]
+    if(max_C[1] < tmp[1]):
+        max_C     = deliver(tmp,3)
+        max_gamma = deliver(gamma,p)
+        max_beta  = deliver(beta,p)
+    else:
+        if(max_C[1] == tmp[1]):
+            if(max_C[2] < tmp[2]):
+                max_C     = deliver(tmp,3)
+                max_gamma = deliver(gamma,p)
+                max_beta  = deliver(beta,p)
+            else:continue
+    for t in range(p):
+        gamma[t] = (1-g)*gamma[t] + g*max_gamma[t] + lr*grad_g[t]
+        beta[t]  = (1-b)*beta[t]  + b*max_beta[t]  + lr*grad_b[t]
+
+p = 2
+N_shots = 10000 # Number of shots to compute the expectation value
+#=========================================================================================
+
+
+def function(z):
+    '''
+    The expectation value function for the scipy 
+    optimizer to optimize
+    '''
+    
+    N = len(z)
+    gammas = z[0:int(N/2)]
+    betas = z[ int(N/2):N]
+    
+    mean,max_c= evaluate(gammas,betas,p)
+    f = -mean
+    return f
+
+def der(z):
+    N = len(z)
+    gammas = z[0:int(N/2)]
+    betas = z[ int(N/2):N]
+    gradient_ga = gradient_g(gammas,betas,int(N/2))
+    gradient_be = gradient_b(gammas,betas,int(N/2)) 
+    der = np.concatenate((gradient_ga,gradient_be))
+    return der
+# initialize the set of gammas and betas
+gammas = 2.0*np.pi*np.random.uniform(0,1,p)
+betas = np.pi*np.random.uniform(0,1,p)
+
+
+# Minimize the Objective function using the Nelder-Mead algorithm
+z0 = np.concatenate((gammas,betas))
+
+res = minimize(function, z0, method='BFGS',jac = der,
+               options={'disp': False})
+
+print('='*100)
+print('QAOA order: ',p)
+print('Solution: ', res.x)
+print('='*100)
+
+
+print(res.x)
+gammas = []
+betas  = []
+for k in range(p):
+    gammas.append(res.x[k])
+    betas.append(res.x[k+p])
+print(gammas,betas)
+hist = []
+for i in range(100):
+    mean, maxofC = evaluate(gammas, betas, p)
+    print('epoch', i, maxofC[1])
+    hist.append(maxofC[1])
+    
+plt.plot(hist)
+
+print(brute_force(n))
+
+def grad(f,x): 
+    '''
+    CENTRAL FINITE DIFFERENCE CALCULATION
+    '''
+    h = np.cbrt(np.finfo(float).eps)
+    d = len(x)
+    nabla = np.zeros(d)
+    for i in range(d): 
+        x_for = np.copy(x) 
+        x_back = np.copy(x)
+        x_for[i] += h 
+        x_back[i] -= h 
+        nabla[i] = (f(x_for) - f(x_back))/(2*h) 
+    return nabla 
+def line_search(f,x,p,nabla):
+    '''
+    BACKTRACK LINE SEARCH WITH WOLFE CONDITIONS
+    '''
+    a = 1
+    c1 = 1e-4 
+    c2 = 0.9 
+    fx = f(x)
+    x_new = x + a * p 
+    nabla_new = grad(f,x_new)
+    while f(x_new) >= fx + (c1*a*nabla.T@p) or nabla_new.T@p <= c2*nabla.T@p : 
+        a *= 0.5
+        x_new = x + a * p 
+        nabla_new = grad(f,x_new)
+    return a
+
+def BFGS(f,x0,max_it):
+    '''
+    DESCRIPTION
+    BFGS Quasi-Newton Method, implemented as described in Nocedal:
+    Numerical Optimisation.
+    INPUTS:
+    f:      function to be optimised 
+    x0:     intial guess
+    max_it: maximum iterations 
+    plot:   if the problem is 2 dimensional, returns 
+            a trajectory plot of the optimisation scheme.
+    OUTPUTS: 
+    x:      the optimal solution of the function f 
+    '''
+    d = len(x0) # dimension of problem 
+    nabla = grad(f,x0) # initial gradient 
+    H = np.eye(d) # initial hessian
+    x = x0[:]
+    x_store = []
+    f_store = []
+    it = 2 
+
+    while it<max_it :
+    #np.linalg.norm(nabla) > 1e-5: # while gradient is positive
+        if it > max_it: 
+            print('Maximum iterations reached!')
+            break
+        it += 1
+        p = -H@nabla # search direction (Newton Method)
+        a = line_search(f,x,p,nabla) # line search 
+        s = a * p 
+        x_new = x + a * p 
+        nabla_new = grad(f,x_new)
+        y = nabla_new - nabla 
+        y = np.array([y])
+        s = np.array([s])
+        y = np.reshape(y,(d,1))
+        s = np.reshape(s,(d,1))
+        r = 1/(y.T@s)
+        li = (np.eye(d)-(r*((s@(y.T)))))
+        ri = (np.eye(d)-(r*((y@(s.T)))))
+        hess_inter = li@H@ri
+        H = hess_inter + (r*((s@(s.T)))) # BFGS Update
+        nabla = nabla_new[:] 
+        x = x_new[:]
+        print(it,x,function(x))
+        f_store.append(function(x))
+        x_store.append(x) # storing x
+    print(x_store)
+    plt.plot(f_store)
+    return x,x_store
+x,x_store = BFGS(function, z0, 10)
+
+a = np.zeros(10)
+print(a)
+print(a.type)
+
